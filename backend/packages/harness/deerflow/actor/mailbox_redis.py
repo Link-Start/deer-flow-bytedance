@@ -107,12 +107,16 @@ class RedisMailbox(Mailbox):
         if self._closed:
             return False
         data = _serialize(msg)
-        if self._maxlen > 0:
-            # Atomic check+push via Lua script to avoid TOCTOU race
-            result = await self._redis.evalsha_or_eval(self._LUA_BOUNDED_PUSH, 1, self._queue_name, data, self._maxlen)
-            return bool(result)
-        await self._redis.lpush(self._queue_name, data)
-        return True
+        try:
+            if self._maxlen > 0:
+                # Atomic check+push via Lua script to avoid TOCTOU race
+                result = await self._redis.eval(self._LUA_BOUNDED_PUSH, 1, self._queue_name, data, self._maxlen)
+                return bool(result)
+            await self._redis.lpush(self._queue_name, data)
+            return True
+        except Exception as e:
+            logger.warning("RedisMailbox.put failed for %s: %s", self._queue_name, e)
+            return False
 
     def put_nowait(self, msg: Any) -> bool:
         """Redis cannot do synchronous non-blocking enqueue reliably.
@@ -121,6 +125,36 @@ class RedisMailbox(Mailbox):
         Use ``put()`` (async) for reliable delivery.
         """
         return False
+
+    async def put_batch(self, msgs: list[Any]) -> int:
+        """Push multiple messages in a single LPUSH command (one round-trip).
+
+        Unbounded queues: all messages sent atomically in one LPUSH.
+        Bounded queues: sequential puts to respect maxlen (no batch Lua script needed).
+        """
+        if self._closed or not msgs:
+            return 0
+        data_list = []
+        for msg in msgs:
+            try:
+                data_list.append(_serialize(msg))
+            except TypeError as e:
+                logger.warning("Skipping non-serializable message in put_batch: %s", e)
+        if not data_list:
+            return 0
+        if self._maxlen > 0:
+            count = 0
+            for data in data_list:
+                # Reuse the Lua script for TOCTOU-safe bounded check (same as put())
+                result = await self._redis.eval(self._LUA_BOUNDED_PUSH, 1, self._queue_name, data, self._maxlen)
+                if result:
+                    count += 1
+                else:
+                    break  # queue full — stop early
+            return count
+        # Unbounded: single LPUSH with all values — one network round-trip
+        await self._redis.lpush(self._queue_name, *data_list)
+        return len(data_list)
 
     async def get(self) -> Any:
         """Blocking dequeue via BRPOP. Retries until a message arrives."""

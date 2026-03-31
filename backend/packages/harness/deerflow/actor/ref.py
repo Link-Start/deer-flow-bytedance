@@ -83,6 +83,10 @@ class ActorStoppedError(Exception):
     """Raised when sending to a stopped actor via ask."""
 
 
+class MailboxFullError(RuntimeError):
+    """Raised when a message is rejected because the mailbox is at capacity."""
+
+
 # ---------------------------------------------------------------------------
 # Internal message wrappers (serializable — no Future objects)
 # ---------------------------------------------------------------------------

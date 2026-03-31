@@ -19,7 +19,8 @@ Usage::
 from .actor import Actor, ActorContext
 from .mailbox import Mailbox, MemoryMailbox
 from .middleware import Middleware
-from .ref import ActorRef, ReplyChannel
+from .ref import ActorRef, MailboxFullError, ReplyChannel
+from .retry import IdempotentActorMixin, IdempotencyStore, RetryEnvelope, ask_with_retry
 from .supervision import AllForOneStrategy, Directive, OneForOneStrategy, SupervisorStrategy
 from .system import ActorSystem, DeadLetter
 
@@ -32,9 +33,14 @@ __all__ = [
     "DeadLetter",
     "Directive",
     "Mailbox",
+    "MailboxFullError",
     "MemoryMailbox",
     "Middleware",
     "OneForOneStrategy",
     "ReplyChannel",
+    "RetryEnvelope",
     "SupervisorStrategy",
+    "IdempotentActorMixin",
+    "IdempotencyStore",
+    "ask_with_retry",
 ]

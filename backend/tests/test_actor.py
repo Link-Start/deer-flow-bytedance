@@ -440,3 +440,95 @@ class TestMiddleware:
         # tell goes through middleware too
         assert any("before:" in entry for entry in mw.log) is False
         await system.shutdown()
+
+    @pytest.mark.anyio
+    async def test_middleware_on_restart_hook(self):
+        """on_restart is called on the middleware when a child actor is restarted."""
+
+        class RestartTrackingMiddleware(Middleware):
+            def __init__(self):
+                self.restart_errors: list[Exception] = []
+
+            async def on_restart(self, actor_ref, error):
+                self.restart_errors.append(error)
+
+        mw = RestartTrackingMiddleware()
+
+        class ChildSpawningParent(Actor):
+            async def on_receive(self, message):
+                if message == "spawn":
+                    ref = await self.context.spawn(CrashActor, "child", middlewares=[mw])
+                    return ref
+
+        system = ActorSystem("test")
+        parent = await system.spawn(ChildSpawningParent, "parent")
+        child = await parent.ask("spawn")
+
+        # Crash the child — parent supervisor will restart it
+        try:
+            await child.ask("crash")
+        except ValueError:
+            pass
+        await asyncio.sleep(0.1)
+
+        assert len(mw.restart_errors) == 1
+        assert isinstance(mw.restart_errors[0], ValueError)
+        await system.shutdown()
+
+
+class TestAskErrorPropagation:
+    @pytest.mark.anyio
+    async def test_ask_propagates_actor_exception(self):
+        """ask() re-raises the original exception type when on_receive crashes."""
+
+        class BoomActor(Actor):
+            async def on_receive(self, message):
+                raise ValueError("intentional crash")
+
+        system = ActorSystem("test")
+        ref = await system.spawn(BoomActor, "boom")
+        with pytest.raises(ValueError, match="intentional crash"):
+            await ref.ask("trigger")
+        await system.shutdown()
+
+    @pytest.mark.anyio
+    async def test_ask_propagates_exception_while_supervised(self):
+        """ask() gets the exception even when the actor is supervised (not stopped)."""
+
+        class SometimesCrashActor(Actor):
+            async def on_receive(self, message):
+                if message == "crash":
+                    raise RuntimeError("supervised crash")
+                return "ok"
+
+        system = ActorSystem("test")
+        ref = await system.spawn(SometimesCrashActor, "sca")
+        with pytest.raises(RuntimeError, match="supervised crash"):
+            await ref.ask("crash")
+        # Root actor keeps running after a crash (consecutive_failures, not restart)
+        result = await ref.ask("hello", timeout=2.0)
+        assert result == "ok"
+        await system.shutdown()
+
+    @pytest.mark.anyio
+    async def test_ask_timeout_late_reply_no_exception(self):
+        """Late reply arriving after ask() timeout is silently dropped — no exception, no orphaned future."""
+
+        class SlowActor(Actor):
+            async def on_receive(self, message):
+                await asyncio.sleep(0.3)
+                return "late"
+
+        system = ActorSystem("test")
+        ref = await system.spawn(SlowActor, "slow")
+
+        with pytest.raises(asyncio.TimeoutError):
+            await ref.ask("go", timeout=0.05)
+
+        # Wait for actor to finish processing — late reply arrives, should be a no-op
+        await asyncio.sleep(0.4)
+        # System still functional: no orphaned futures, no leaked state
+        assert ref.is_alive
+        result = await ref.ask("go", timeout=2.0)
+        assert result == "late"
+        await system.shutdown()

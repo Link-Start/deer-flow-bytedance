@@ -11,7 +11,7 @@ from typing import Any
 from .actor import Actor, ActorContext
 from .mailbox import Empty, Mailbox, MemoryMailbox
 from .middleware import ActorMailboxContext, Middleware, NextFn, build_middleware_chain
-from .ref import ActorRef, ActorStoppedError, ReplyChannel, _Envelope, _ReplyMessage, _ReplyRegistry, _Stop
+from .ref import ActorRef, ActorStoppedError, MailboxFullError, ReplyChannel, _Envelope, _ReplyMessage, _ReplyRegistry, _Stop
 from .supervision import Directive, SupervisorStrategy
 
 logger = logging.getLogger(__name__)
@@ -87,7 +87,11 @@ class ActorSystem:
             middlewares=middlewares or [],
         )
         self._root_cells[name] = cell
-        await cell.start()
+        try:
+            await cell.start()
+        except Exception:
+            del self._root_cells[name]
+            raise
         return cell.ref
 
     async def shutdown(self, *, timeout: float = 10.0) -> None:
@@ -99,7 +103,12 @@ class ActorSystem:
             if cell.task is not None:
                 tasks.append(cell.task)
         if tasks:
-            await asyncio.wait(tasks, timeout=timeout)
+            _, pending = await asyncio.wait(tasks, timeout=timeout)
+            # Cancel tasks that didn't finish within the timeout to prevent zombie tasks
+            for t in pending:
+                t.cancel()
+            if pending:
+                await asyncio.wait(pending, timeout=2.0)
         self._root_cells.clear()
         self._replies.reject_all(ActorStoppedError("ActorSystem shutting down"))
         await self._reply_channel.stop_listener()
@@ -188,16 +197,25 @@ class _ActorCell:
         self.task = asyncio.create_task(self._run(), name=f"actor:{self.path}")
 
     async def enqueue(self, msg: _Envelope | _Stop) -> None:
-        if not self.mailbox.put_nowait(msg):
+        # Try non-blocking first (fast path for MemoryMailbox)
+        if self.mailbox.put_nowait(msg):
+            return
+        # Fallback to async put (required for Redis and other async backends)
+        if not await self.mailbox.put(msg):
             if isinstance(msg, _Envelope) and msg.correlation_id is not None:
-                self.system._replies.reject(msg.correlation_id, RuntimeError(f"Mailbox full: {self.path}"))
+                self.system._replies.reject(msg.correlation_id, MailboxFullError(f"Mailbox full: {self.path}"))
             elif isinstance(msg, _Envelope):
                 self.system._dead_letter(self.ref, msg.payload, msg.sender)
 
     def request_stop(self) -> None:
-        """Request graceful shutdown. Falls back to task.cancel() if mailbox full."""
+        """Request graceful shutdown.
+
+        Tries put_nowait first. If that fails (full or unsupported backend),
+        cancels the task directly so _run exits via CancelledError → finally → _shutdown.
+        """
         if not self.stopped:
             if not self.mailbox.put_nowait(_Stop()):
+                # Redis/async backends can't put_nowait — cancel the task
                 if self.task is not None and not self.task.done():
                     self.task.cancel()
                 else:
@@ -223,7 +241,11 @@ class _ActorCell:
             middlewares=middlewares or [],
         )
         self.children[name] = child
-        await child.start()
+        try:
+            await child.start()
+        except Exception:
+            del self.children[name]
+            raise
         return child.ref
 
     # -- Processing loop -------------------------------------------------------
@@ -310,6 +332,11 @@ class _ActorCell:
         # Remove from parent
         if self.parent is not None:
             self.parent.children.pop(self.name, None)
+        # Close mailbox to release backend resources (e.g. Redis connections)
+        try:
+            await self.mailbox.close()
+        except Exception:
+            logger.exception("Error closing mailbox for %s", self.path)
 
     # -- Supervision -----------------------------------------------------------
 
@@ -337,8 +364,16 @@ class _ActorCell:
             return
 
         if directive == Directive.escalate:
-            logger.info("Supervisor %s: escalate %s", self.path, type(error).__name__)
-            raise error
+            # Stop the failing child, then propagate failure up the supervision chain.
+            # We cannot use `raise error` here — that would crash the child's _run
+            # loop instead of notifying the grandparent's supervisor.
+            child.request_stop()
+            if self.parent is not None:
+                logger.info("Supervisor %s: escalate %s to grandparent %s", self.path, type(error).__name__, self.parent.path)
+                await self.parent._handle_child_failure(self, error)
+            else:
+                logger.error("Uncaught escalation at root actor %s: %s", self.path, error)
+            return
 
         if directive == Directive.restart:
             for name in affected:

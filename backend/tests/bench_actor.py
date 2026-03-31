@@ -2,7 +2,6 @@
 
 import asyncio
 import time
-import statistics
 
 from deerflow.actor import Actor, ActorSystem, Middleware
 
@@ -17,7 +16,11 @@ class CounterActor(Actor):
         self.count = 0
 
     async def on_receive(self, message):
-        self.count += 1
+        if message == "inc":
+            self.count += 1
+            return self.count
+        if message == "get":
+            return self.count
         return self.count
 
 
@@ -69,6 +72,8 @@ async def bench_tell_throughput(n=100_000):
         await ref.tell("inc")
     # Wait for all messages to be processed
     count = await ref.ask("get", timeout=30.0)
+    if count != n:
+        print(f"  warning: expected {n} processed, got {count}")
     elapsed = time.perf_counter() - start
 
     await system.shutdown()
