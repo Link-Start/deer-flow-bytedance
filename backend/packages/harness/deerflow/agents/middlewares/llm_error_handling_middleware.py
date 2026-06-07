@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 import time
 from collections.abc import Awaitable, Callable
 from email.utils import parsedate_to_datetime
@@ -18,6 +19,8 @@ from langchain.agents.middleware.types import (
 )
 from langchain_core.messages import AIMessage
 from langgraph.errors import GraphBubbleUp
+
+from deerflow.config.app_config import AppConfig
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +70,71 @@ class LLMErrorHandlingMiddleware(AgentMiddleware[AgentState]):
     retry_base_delay_ms: int = 1000
     retry_cap_delay_ms: int = 8000
 
+    def __init__(self, *, app_config: AppConfig, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+
+        self.circuit_failure_threshold = app_config.circuit_breaker.failure_threshold
+        self.circuit_recovery_timeout_sec = app_config.circuit_breaker.recovery_timeout_sec
+
+        # Circuit Breaker state
+        self._circuit_lock = threading.Lock()
+        self._circuit_failure_count = 0
+        self._circuit_open_until = 0.0
+        self._circuit_state = "closed"
+        self._circuit_probe_in_flight = False
+
+    def _check_circuit(self) -> bool:
+        """Returns True if circuit is OPEN (fast fail), False otherwise."""
+        with self._circuit_lock:
+            now = time.time()
+
+            if self._circuit_state == "open":
+                if now < self._circuit_open_until:
+                    return True
+                self._circuit_state = "half_open"
+                self._circuit_probe_in_flight = False
+
+            if self._circuit_state == "half_open":
+                if self._circuit_probe_in_flight:
+                    return True
+                self._circuit_probe_in_flight = True
+                return False
+
+            return False
+
+    def _record_success(self) -> None:
+        with self._circuit_lock:
+            if self._circuit_state != "closed" or self._circuit_failure_count > 0:
+                logger.info("Circuit breaker reset (Closed). LLM service recovered.")
+            self._circuit_failure_count = 0
+            self._circuit_open_until = 0.0
+            self._circuit_state = "closed"
+            self._circuit_probe_in_flight = False
+
+    def _record_failure(self) -> None:
+        with self._circuit_lock:
+            if self._circuit_state == "half_open":
+                self._circuit_open_until = time.time() + self.circuit_recovery_timeout_sec
+                self._circuit_state = "open"
+                self._circuit_probe_in_flight = False
+                logger.error(
+                    "Circuit breaker probe failed (Open). Will probe again after %ds.",
+                    self.circuit_recovery_timeout_sec,
+                )
+                return
+
+            self._circuit_failure_count += 1
+            if self._circuit_failure_count >= self.circuit_failure_threshold:
+                self._circuit_open_until = time.time() + self.circuit_recovery_timeout_sec
+                if self._circuit_state != "open":
+                    self._circuit_state = "open"
+                    self._circuit_probe_in_flight = False
+                    logger.error(
+                        "Circuit breaker tripped (Open). Threshold reached (%d). Will probe after %ds.",
+                        self.circuit_failure_threshold,
+                        self.circuit_recovery_timeout_sec,
+                    )
+
     def _classify_error(self, exc: BaseException) -> tuple[bool, str]:
         detail = _extract_error_detail(exc)
         lowered = detail.lower()
@@ -83,6 +151,8 @@ class LLMErrorHandlingMiddleware(AgentMiddleware[AgentState]):
             "APITimeoutError",
             "APIConnectionError",
             "InternalServerError",
+            "ReadError",  # httpx.ReadError: connection dropped mid-stream
+            "RemoteProtocolError",  # httpx: server closed connection unexpectedly
         }:
             return True, "transient"
         if status_code in _RETRIABLE_STATUS_CODES:
@@ -104,6 +174,27 @@ class LLMErrorHandlingMiddleware(AgentMiddleware[AgentState]):
         reason_text = "provider is busy" if reason == "busy" else "provider request failed temporarily"
         return f"LLM request retry {attempt}/{self.retry_max_attempts}: {reason_text}. Retrying in {seconds}s."
 
+    def _build_circuit_breaker_message(self) -> str:
+        return "The configured LLM provider is currently unavailable due to continuous failures. Circuit breaker is engaged to protect the system. Please wait a moment before trying again."
+
+    def _build_error_fallback_message(
+        self,
+        content: str,
+        *,
+        error_type: str,
+        reason: str,
+        detail: str,
+    ) -> AIMessage:
+        return AIMessage(
+            content=content,
+            additional_kwargs={
+                "deerflow_error_fallback": True,
+                "error_type": error_type,
+                "error_reason": reason,
+                "error_detail": detail,
+            },
+        )
+
     def _build_user_message(self, exc: BaseException, reason: str) -> str:
         detail = _extract_error_detail(exc)
         if reason == "quota":
@@ -113,6 +204,14 @@ class LLMErrorHandlingMiddleware(AgentMiddleware[AgentState]):
         if reason in {"busy", "transient"}:
             return "The configured LLM provider is temporarily unavailable after multiple retries. Please wait a moment and continue the conversation."
         return f"LLM request failed: {detail}"
+
+    def _build_user_fallback_message(self, exc: BaseException, reason: str) -> AIMessage:
+        return self._build_error_fallback_message(
+            self._build_user_message(exc, reason),
+            error_type=type(exc).__name__,
+            reason=reason,
+            detail=_extract_error_detail(exc),
+        )
 
     def _emit_retry_event(self, attempt: int, wait_ms: int, reason: str) -> None:
         try:
@@ -138,12 +237,25 @@ class LLMErrorHandlingMiddleware(AgentMiddleware[AgentState]):
         request: ModelRequest,
         handler: Callable[[ModelRequest], ModelResponse],
     ) -> ModelCallResult:
+        if self._check_circuit():
+            return self._build_error_fallback_message(
+                self._build_circuit_breaker_message(),
+                error_type="CircuitBreakerOpen",
+                reason="circuit_open",
+                detail="LLM circuit breaker is open",
+            )
+
         attempt = 1
         while True:
             try:
-                return handler(request)
+                response = handler(request)
+                self._record_success()
+                return response
             except GraphBubbleUp:
                 # Preserve LangGraph control-flow signals (interrupt/pause/resume).
+                with self._circuit_lock:
+                    if self._circuit_state == "half_open":
+                        self._circuit_probe_in_flight = False
                 raise
             except Exception as exc:
                 retriable, reason = self._classify_error(exc)
@@ -166,7 +278,9 @@ class LLMErrorHandlingMiddleware(AgentMiddleware[AgentState]):
                     _extract_error_detail(exc),
                     exc_info=exc,
                 )
-                return AIMessage(content=self._build_user_message(exc, reason))
+                if retriable:
+                    self._record_failure()
+                return self._build_user_fallback_message(exc, reason)
 
     @override
     async def awrap_model_call(
@@ -174,12 +288,25 @@ class LLMErrorHandlingMiddleware(AgentMiddleware[AgentState]):
         request: ModelRequest,
         handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
     ) -> ModelCallResult:
+        if self._check_circuit():
+            return self._build_error_fallback_message(
+                self._build_circuit_breaker_message(),
+                error_type="CircuitBreakerOpen",
+                reason="circuit_open",
+                detail="LLM circuit breaker is open",
+            )
+
         attempt = 1
         while True:
             try:
-                return await handler(request)
+                response = await handler(request)
+                self._record_success()
+                return response
             except GraphBubbleUp:
                 # Preserve LangGraph control-flow signals (interrupt/pause/resume).
+                with self._circuit_lock:
+                    if self._circuit_state == "half_open":
+                        self._circuit_probe_in_flight = False
                 raise
             except Exception as exc:
                 retriable, reason = self._classify_error(exc)
@@ -202,7 +329,9 @@ class LLMErrorHandlingMiddleware(AgentMiddleware[AgentState]):
                     _extract_error_detail(exc),
                     exc_info=exc,
                 )
-                return AIMessage(content=self._build_user_message(exc, reason))
+                if retriable:
+                    self._record_failure()
+                return self._build_user_fallback_message(exc, reason)
 
 
 def _matches_any(detail: str, patterns: tuple[str, ...]) -> bool:
