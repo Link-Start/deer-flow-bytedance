@@ -364,6 +364,7 @@ export function ArtifactFileDetail({
             className="size-full resize-none rounded-none border-none"
             value={visibleContent ?? ""}
             readonly
+            language={language}
           />
         )}
         {!isCodeFile && canPreviewInBrowser && (
