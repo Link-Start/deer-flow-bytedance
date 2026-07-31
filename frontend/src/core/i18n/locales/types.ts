@@ -88,6 +88,7 @@ export interface Translations {
     limited: (previewSize: string, totalSize?: string) => string;
     loadFullFile: string;
     loadingFullFile: string;
+    previewFailed: string;
   };
 
   // Citations

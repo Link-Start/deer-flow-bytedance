@@ -179,6 +179,7 @@ export function ArtifactFileDetail({
     fullContentRequested,
     loadFullContent,
     isLoading,
+    error,
   } = useArtifactContent({
     threadId,
     filepath: filepathFromProps,
@@ -381,7 +382,17 @@ export function ArtifactFileDetail({
           </div>
         )}
         <div className="min-h-0 flex-1">
+          {error && (
+            <ArtifactPreviewError
+              filepath={filepath}
+              threadId={threadId}
+              isMock={isMock}
+              message={t.artifactPreview.previewFailed}
+              downloadLabel={t.common.download}
+            />
+          )}
           {artifactViewState.canPreview &&
+            !error &&
             effectiveViewMode === "preview" &&
             !isLoading &&
             (!truncated || language === "markdown") &&
@@ -394,6 +405,7 @@ export function ArtifactFileDetail({
               />
             )}
           {isCodeFile &&
+            !error &&
             effectiveViewMode === "code" &&
             !truncated &&
             !isLoading && (
@@ -404,11 +416,14 @@ export function ArtifactFileDetail({
                 language={language}
               />
             )}
-          {isCodeFile && truncated && effectiveViewMode === "code" && (
-            <pre className="size-full overflow-auto p-4 font-mono text-sm whitespace-pre-wrap">
-              {visibleContent}
-            </pre>
-          )}
+          {isCodeFile &&
+            !error &&
+            truncated &&
+            effectiveViewMode === "code" && (
+              <pre className="size-full overflow-auto p-4 font-mono text-sm whitespace-pre-wrap">
+                {visibleContent}
+              </pre>
+            )}
           {!isCodeFile && canPreviewInBrowser && (
             <iframe
               className="size-full"
@@ -426,6 +441,43 @@ export function ArtifactFileDetail({
         </div>
       </ArtifactContent>
     </Artifact>
+  );
+}
+
+function ArtifactPreviewError({
+  filepath,
+  threadId,
+  isMock,
+  message,
+  downloadLabel,
+}: {
+  filepath: string;
+  threadId: string;
+  isMock?: boolean;
+  message: string;
+  downloadLabel: string;
+}) {
+  return (
+    <div className="flex size-full items-center justify-center p-6">
+      <div className="flex max-w-sm flex-col items-center gap-4 text-center">
+        <p className="text-muted-foreground text-sm">{message}</p>
+        <Button asChild>
+          <a
+            href={urlOfArtifact({
+              filepath,
+              threadId,
+              download: true,
+              isMock,
+            })}
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            <DownloadIcon className="size-4" />
+            {downloadLabel}
+          </a>
+        </Button>
+      </div>
+    </div>
   );
 }
 
