@@ -101,6 +101,15 @@ export const enUS: Translations = {
     linkCopied: "Link copied to clipboard",
   },
 
+  artifactPreview: {
+    limited: (previewSize, totalSize) =>
+      totalSize
+        ? `Showing the first ${previewSize} of ${totalSize}.`
+        : `Showing the first ${previewSize}.`,
+    loadFullFile: "Load full file",
+    loadingFullFile: "Loading full file...",
+  },
+
   // Citations
   citations: {
     sourcesSummary: (count) =>
